@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head><meta charset="UTF-8"><title>sprites debug</title></head>
+<body>
+  <pre id="out">PENDING</pre>
+  <script type="module">
+    const out = document.getElementById('out');
+    try {
+      const { loadSprites } = await import('../js/sprites.js');
+      const s = loadSprites();
+      const lines = [];
+      lines.push('keys: ' + Object.keys(s).join(','));
+      lines.push('chars: ' + Object.keys(s.chars).join(','));
+      for (const id of Object.keys(s.chars)) {
+        const set = s.chars[id];
+        lines.push(id + ' dirs: ' + Object.keys(set).join(',') +
+          ' down.len=' + (set.down && set.down.length) +
+          ' down[0]=' + (set.down && set.down[0] && set.down[0].tagName) +
+          ' down[1]=' + (set.down && set.down[1] && set.down[1].tagName));
+      }
+      lines.push('balloon.len=' + s.balloon.length);
+      lines.push('water keys: ' + Object.keys(s.water).join(','));
+      lines.push('item keys: ' + Object.keys(s.items).join(','));
+      out.textContent = 'DIAG\n' + lines.join('\n');
+    } catch (e) {
+      out.textContent = 'THROW: ' + e.message + '\n' + e.stack;
+    }
+  </script>
+</body>
+</html>

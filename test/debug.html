@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head><meta charset="UTF-8"><title>debug</title></head>
+<body>
+  <div id="app"><canvas id="game"></canvas></div>
+  <pre id="err">NO_ERROR_YET</pre>
+  <script>
+    window.onerror = function (msg, src, line, col, err) {
+      document.getElementById('err').textContent =
+        'ERROR: ' + msg + ' @ ' + src + ':' + line + ':' + col + '\n' + (err && err.stack || '');
+    };
+    window.addEventListener('unhandledrejection', function (e) {
+      document.getElementById('err').textContent = 'REJECTION: ' + e.reason;
+    });
+  </script>
+  <script type="module" src="../js/main.js"></script>
+</body>
+</html>

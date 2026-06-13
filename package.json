@@ -1,0 +1,11 @@
+{
+  "name": "splash-arcade",
+  "version": "1.0.0",
+  "description": "크레이지 아케이드 스타일의 물풍선 배틀 웹 게임 (오리지널 팬 메이드)",
+  "type": "module",
+  "scripts": {
+    "test": "node test/smoke.mjs",
+    "start": "npx serve ."
+  },
+  "license": "MIT"
+}

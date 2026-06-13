@@ -1,0 +1,29 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: linear-gradient(160deg, #7ec8f7 0%, #b3e5fc 45%, #d8f3ff 100%);
+  font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#game {
+  image-rendering: pixelated;
+  border-radius: 12px;
+  box-shadow: 0 16px 48px rgba(20, 60, 120, 0.35);
+  background: #1a3a5c;
+  max-width: 100vw;
+  max-height: 100vh;
+}
