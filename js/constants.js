@@ -3,9 +3,14 @@
 export const TILE = 48;            // 타일 크기(px)
 export const COLS = 15;            // 맵 가로 칸 수
 export const ROWS = 13;            // 맵 세로 칸 수
-export const HUD_H = 64;           // 상단 HUD 높이(px)
-export const CANVAS_W = COLS * TILE;            // 720
-export const CANVAS_H = ROWS * TILE + HUD_H;    // 688
+
+// 16:9 고정 뷰 — 게임판은 중앙, 좌우에 HUD 패널
+export const VIEW_W = 1280;
+export const VIEW_H = 720;
+export const BOARD_W = COLS * TILE;             // 720
+export const BOARD_H = ROWS * TILE;             // 624
+export const BOARD_X = (VIEW_W - BOARD_W) / 2;  // 280
+export const BOARD_Y = (VIEW_H - BOARD_H) / 2;  // 48
 
 // 타일 종류
 export const T_EMPTY = 0;

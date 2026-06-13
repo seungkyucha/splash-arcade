@@ -1,33 +1,62 @@
-// 메인 — 화면 상태 머신(타이틀/캐릭터 선택/인게임/결과), 입력, 렌더링
+// 메인 v2 — 16:9(1280×720) 고정 레이아웃, 데스크톱+모바일 입력, 렌더링
 
 import {
-  TILE, COLS, ROWS, HUD_H, CANVAS_W, CANVAS_H,
+  TILE, COLS, ROWS,
+  VIEW_W, VIEW_H, BOARD_W, BOARD_H, BOARD_X, BOARD_Y,
   T_SOLID, T_BOX,
   ST_ALIVE, ST_TRAPPED, ST_DEAD,
-  CHARACTERS, ROUND_TIME,
+  CHARACTERS, TRAP_DURATION,
 } from './constants.js';
-import { loadSprites } from './sprites.js';
-import { Game, tileCenter } from './game.js';
+import { loadSprites, SS } from './sprites.js';
+import { Game } from './game.js';
 import { unlockAudio, sfx, startBgm, stopBgm, toggleMute, isMuted } from './sound.js';
 
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
-canvas.width = CANVAS_W;
-canvas.height = CANVAS_H;
+
+// DPR 대응 (최대 2배) — 모바일에서 선명하게
+const DPR = Math.min(2, window.devicePixelRatio || 1);
+canvas.width = VIEW_W * DPR;
+canvas.height = VIEW_H * DPR;
+ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
 
 function fitCanvas() {
-  const scale = Math.min(
-    window.innerWidth / CANVAS_W,
-    window.innerHeight / CANVAS_H,
-    1.4
-  );
-  canvas.style.width = CANVAS_W * scale + 'px';
-  canvas.style.height = CANVAS_H * scale + 'px';
+  const scale = Math.min(window.innerWidth / VIEW_W, window.innerHeight / VIEW_H);
+  canvas.style.width = Math.floor(VIEW_W * scale) + 'px';
+  canvas.style.height = Math.floor(VIEW_H * scale) + 'px';
 }
 window.addEventListener('resize', fitCanvas);
 fitCanvas();
 
 const sprites = loadSprites();
+
+// 논리 크기로 스프라이트 그리기 (SS 배율 보정)
+function blit(img, x, y, w, h) {
+  ctx.drawImage(img, x, y, w ?? img.width / SS, h ?? img.height / SS);
+}
+
+function outlinedText(text, x, y, size, fill, stroke, strokeW, weight = '900') {
+  ctx.font = `${weight} ${size}px 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif`;
+  ctx.textAlign = 'center';
+  if (stroke) {
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = strokeW;
+    ctx.strokeStyle = stroke;
+    ctx.strokeText(text, x, y);
+  }
+  ctx.fillStyle = fill;
+  ctx.fillText(text, x, y);
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
 
 // ---------- 상태 ----------
 
@@ -35,12 +64,16 @@ let screen = 'title';   // title | select | playing | result
 let game = null;
 let selectedChar = 0;
 let globalTime = 0;
+let touchMode = false;  // 터치 입력이 감지되면 가상 컨트롤 표시
 
-const input = {
-  dir: null,
-  action: false,
-  dirStack: [],   // 마지막에 누른 방향 우선
-};
+const input = { dir: null, action: false, dirStack: [] };
+
+// 터치 조이스틱/버튼 상태
+const joy = { active: false, pointerId: null, baseX: 0, baseY: 0, dx: 0, dy: 0 };
+const JOY_AREA = { x: 0, y: 0, w: BOARD_X, h: VIEW_H };                 // 좌측 패널 전체
+const ACT_BTN = { x: VIEW_W - 140, y: VIEW_H - 150, r: 75 };            // 우하단 버튼
+
+// ---------- 키보드 ----------
 
 const KEY_DIR = {
   ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
@@ -50,17 +83,12 @@ const KEY_DIR = {
 window.addEventListener('keydown', (e) => {
   unlockAudio();
   if (e.repeat) return;
-
   if (e.code === 'KeyM') { toggleMute(); return; }
 
   if (screen === 'title') {
-    if (e.code === 'Space' || e.code === 'Enter') {
-      sfx.select();
-      screen = 'select';
-    }
+    if (e.code === 'Space' || e.code === 'Enter') { sfx.select(); screen = 'select'; }
     return;
   }
-
   if (screen === 'select') {
     if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
       selectedChar = (selectedChar + CHARACTERS.length - 1) % CHARACTERS.length;
@@ -75,7 +103,6 @@ window.addEventListener('keydown', (e) => {
     }
     return;
   }
-
   if (screen === 'playing') {
     const dir = KEY_DIR[e.code];
     if (dir) {
@@ -90,14 +117,9 @@ window.addEventListener('keydown', (e) => {
     }
     return;
   }
-
   if (screen === 'result') {
-    if (e.code === 'Space' || e.code === 'Enter') {
-      sfx.select();
-      screen = 'select';
-    } else if (e.code === 'Escape') {
-      backToTitle();
-    }
+    if (e.code === 'Space' || e.code === 'Enter') { sfx.select(); startGame(); }
+    else if (e.code === 'Escape') backToTitle();
   }
 });
 
@@ -109,12 +131,121 @@ window.addEventListener('keyup', (e) => {
   }
 });
 
-// 클릭/터치로도 진행 가능 (모바일 최소 지원)
-canvas.addEventListener('pointerdown', () => {
+// ---------- 포인터(터치/마우스) ----------
+
+function toView(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: ((e.clientX - rect.left) / rect.width) * VIEW_W,
+    y: ((e.clientY - rect.top) / rect.height) * VIEW_H,
+  };
+}
+
+// 화면별 버튼 영역
+const BTN_SELECT_START = { x: VIEW_W / 2 - 130, y: 565, w: 260, h: 64 };
+const BTN_RESULT_RETRY = { x: VIEW_W / 2 - 230, y: VIEW_H / 2 + 60, w: 210, h: 60 };
+const BTN_RESULT_TITLE = { x: VIEW_W / 2 + 20, y: VIEW_H / 2 + 60, w: 210, h: 60 };
+
+function inRect(p, r) {
+  return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+}
+
+canvas.addEventListener('pointerdown', (e) => {
   unlockAudio();
-  if (screen === 'title') { sfx.select(); screen = 'select'; }
-  else if (screen === 'result') { sfx.select(); screen = 'select'; }
+  if (e.pointerType === 'touch') touchMode = true;
+  const p = toView(e);
+
+  if (screen === 'title') {
+    sfx.select();
+    screen = 'select';
+    return;
+  }
+
+  if (screen === 'select') {
+    // 캐릭터 카드 탭
+    const card = selectCardAt(p);
+    if (card >= 0) {
+      if (selectedChar === card) startGame();   // 같은 카드 한 번 더 → 시작
+      else { selectedChar = card; sfx.select(); }
+      return;
+    }
+    if (inRect(p, BTN_SELECT_START)) startGame();
+    return;
+  }
+
+  if (screen === 'playing') {
+    // 액션 버튼
+    const d = Math.hypot(p.x - ACT_BTN.x, p.y - ACT_BTN.y);
+    if (d <= ACT_BTN.r + 22) {
+      input.action = true;
+      return;
+    }
+    // 조이스틱 (좌측 패널 또는 화면 좌측 1/3)
+    if (p.x < JOY_AREA.w + 60 && !joy.active) {
+      joy.active = true;
+      joy.pointerId = e.pointerId;
+      joy.baseX = p.x;
+      joy.baseY = p.y;
+      joy.dx = 0;
+      joy.dy = 0;
+      canvas.setPointerCapture(e.pointerId);
+    }
+    return;
+  }
+
+  if (screen === 'result') {
+    if (inRect(p, BTN_RESULT_RETRY)) { sfx.select(); startGame(); }
+    else if (inRect(p, BTN_RESULT_TITLE)) { sfx.select(); backToTitle(); }
+  }
 });
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!joy.active || e.pointerId !== joy.pointerId) return;
+  const p = toView(e);
+  joy.dx = p.x - joy.baseX;
+  joy.dy = p.y - joy.baseY;
+  const len = Math.hypot(joy.dx, joy.dy);
+  const max = 58;
+  if (len > max) {
+    joy.dx = (joy.dx / len) * max;
+    joy.dy = (joy.dy / len) * max;
+  }
+});
+
+function endJoy(e) {
+  if (joy.active && e.pointerId === joy.pointerId) {
+    joy.active = false;
+    joy.dx = 0;
+    joy.dy = 0;
+  }
+}
+canvas.addEventListener('pointerup', endJoy);
+canvas.addEventListener('pointercancel', endJoy);
+canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// 조이스틱 → 방향 (매 프레임)
+function joyDir() {
+  if (!joy.active) return null;
+  const len = Math.hypot(joy.dx, joy.dy);
+  if (len < 18) return null;
+  if (Math.abs(joy.dx) > Math.abs(joy.dy)) return joy.dx > 0 ? 'right' : 'left';
+  return joy.dy > 0 ? 'down' : 'up';
+}
+
+// 캐릭터 선택 카드 배치
+const CARD_W = 170, CARD_H = 240, CARD_GAP = 28;
+function cardX(i) {
+  const total = CHARACTERS.length * (CARD_W + CARD_GAP) - CARD_GAP;
+  return VIEW_W / 2 - total / 2 + i * (CARD_W + CARD_GAP);
+}
+const CARD_Y = 230;
+
+function selectCardAt(p) {
+  for (let i = 0; i < CHARACTERS.length; i++) {
+    if (p.x >= cardX(i) && p.x <= cardX(i) + CARD_W && p.y >= CARD_Y && p.y <= CARD_Y + CARD_H) return i;
+  }
+  return -1;
+}
 
 function startGame() {
   game = new Game(selectedChar);
@@ -122,6 +253,7 @@ function startGame() {
   input.dir = null;
   input.dirStack = [];
   input.action = false;
+  joy.active = false;
   sfx.start();
   startBgm();
 }
@@ -132,183 +264,264 @@ function backToTitle() {
   stopBgm();
 }
 
-// ---------- 렌더링 ----------
+// ---------- 공통 배경 ----------
 
-function draw() {
-  ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
-
-  if (screen === 'title') drawTitle();
-  else if (screen === 'select') drawSelect();
-  else if (screen === 'playing' || screen === 'result') drawGame();
-
-  if (screen === 'result') drawResult();
-}
-
-function drawTitle() {
-  // 하늘 배경
-  const g = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
-  g.addColorStop(0, '#5db8f0');
-  g.addColorStop(1, '#bfe9ff');
+function drawBackdrop() {
+  const g = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+  g.addColorStop(0, '#2a78c2');
+  g.addColorStop(0.6, '#5db8f0');
+  g.addColorStop(1, '#9adcff');
   ctx.fillStyle = g;
-  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 
-  // 떠다니는 물방울 장식
-  for (let i = 0; i < 14; i++) {
-    const x = (i * 137 + globalTime * 18) % (CANVAS_W + 60) - 30;
-    const y = 80 + ((i * 89) % (CANVAS_H - 160)) + Math.sin(globalTime * 1.5 + i) * 12;
-    const r = 8 + (i % 4) * 5;
-    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  // 떠다니는 물방울
+  for (let i = 0; i < 16; i++) {
+    const x = (i * 173 + globalTime * 22) % (VIEW_W + 80) - 40;
+    const y = 60 + ((i * 127) % (VIEW_H - 120)) + Math.sin(globalTime * 1.4 + i) * 14;
+    const r = 6 + (i % 5) * 5;
+    ctx.fillStyle = 'rgba(255,255,255,0.16)';
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
     ctx.beginPath();
     ctx.arc(x - r * 0.3, y - r * 0.3, r * 0.25, 0, Math.PI * 2);
     ctx.fill();
   }
+}
+
+// ---------- 타이틀 ----------
+
+function drawTitle() {
+  drawBackdrop();
 
   // 로고
-  ctx.save();
-  ctx.translate(CANVAS_W / 2, 180 + Math.sin(globalTime * 2) * 6);
-  ctx.textAlign = 'center';
-  ctx.font = '900 64px "Malgun Gothic", sans-serif';
-  ctx.lineWidth = 12;
-  ctx.strokeStyle = '#1a5fa8';
-  ctx.strokeText('스플래시', 0, 0);
-  ctx.strokeText('아케이드', 0, 70);
-  const lg = ctx.createLinearGradient(0, -50, 0, 80);
-  lg.addColorStop(0, '#ffe14d');
-  lg.addColorStop(0.5, '#ffb94d');
-  lg.addColorStop(1, '#ff8a3d');
-  ctx.fillStyle = lg;
-  ctx.fillText('스플래시', 0, 0);
-  ctx.fillText('아케이드', 0, 70);
-  ctx.restore();
+  const ly = 200 + Math.sin(globalTime * 2) * 8;
+  outlinedText('스플래시', VIEW_W / 2, ly, 88, '#ffd84d', '#15497e', 18);
+  outlinedText('아케이드', VIEW_W / 2, ly + 92, 88, '#ff9e3d', '#15497e', 18);
+  // 로고 물방울 포인트
+  blit(sprites.balloon[Math.floor(globalTime * 6) % 3], VIEW_W / 2 + 248, ly - 60, 72, 72);
 
   // 캐릭터 행진
   for (let i = 0; i < CHARACTERS.length; i++) {
     const ch = CHARACTERS[i];
-    const frame = Math.floor(globalTime * 6 + i) % 2;
-    const x = CANVAS_W / 2 - 150 + i * 100;
-    const y = 360 + Math.sin(globalTime * 4 + i * 1.3) * 4;
-    ctx.drawImage(sprites.chars[ch.id].down[frame], x - TILE / 2, y);
+    const frame = [0, 1, 0, 2][Math.floor(globalTime * 6 + i) % 4];
+    const x = VIEW_W / 2 - 230 + i * 130;
+    const y = 420 + Math.sin(globalTime * 4 + i * 1.3) * 5;
+    blit(sprites.chars[ch.id].down[frame], x, y, 72, 96);
   }
 
-  // 안내
-  ctx.textAlign = 'center';
-  ctx.font = 'bold 26px "Malgun Gothic", sans-serif';
-  ctx.fillStyle = Math.sin(globalTime * 5) > -0.2 ? '#fff' : 'rgba(255,255,255,0.25)';
-  ctx.fillText('SPACE 키를 눌러 시작', CANVAS_W / 2, 500);
+  const blink = Math.sin(globalTime * 5) > -0.2;
+  outlinedText(touchMode ? '화면을 터치해서 시작' : 'SPACE 키를 눌러 시작', VIEW_W / 2, 600,
+    30, blink ? '#fff' : 'rgba(255,255,255,0.35)', '#15497e', 8);
 
-  ctx.font = '15px "Malgun Gothic", sans-serif';
+  ctx.font = '16px "Malgun Gothic", sans-serif';
   ctx.fillStyle = 'rgba(255,255,255,0.85)';
-  ctx.fillText('이동: 방향키/WASD · 물풍선: SPACE · 음소거: M', CANVAS_W / 2, 560);
-  ctx.fillText('물풍선으로 상대를 가두고 터뜨려 최후의 1인이 되세요!', CANVAS_W / 2, 585);
-  ctx.font = '12px "Malgun Gothic", sans-serif';
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.fillText('팬 메이드 오리지널 게임 · 모든 에셋은 자체 제작되었습니다', CANVAS_W / 2, 645);
+  ctx.textAlign = 'center';
+  ctx.fillText('이동: 방향키/WASD 또는 가상 조이스틱 · 물풍선: SPACE 또는 버튼 · 음소거: M', VIEW_W / 2, 655);
+  ctx.font = '13px "Malgun Gothic", sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText('팬 메이드 오리지널 게임 · 모든 에셋 자체 제작', VIEW_W / 2, 695);
 }
 
+// ---------- 캐릭터 선택 ----------
+
 function drawSelect() {
-  const g = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
-  g.addColorStop(0, '#4aa8e8');
-  g.addColorStop(1, '#a8ddff');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  drawBackdrop();
 
-  ctx.textAlign = 'center';
-  ctx.font = '900 40px "Malgun Gothic", sans-serif';
-  ctx.lineWidth = 8;
-  ctx.strokeStyle = '#1a5fa8';
-  ctx.strokeText('캐릭터 선택', CANVAS_W / 2, 110);
-  ctx.fillStyle = '#fff';
-  ctx.fillText('캐릭터 선택', CANVAS_W / 2, 110);
-
-  const cardW = 130, cardH = 190;
-  const startX = CANVAS_W / 2 - (CHARACTERS.length * (cardW + 20) - 20) / 2;
+  outlinedText('캐릭터 선택', VIEW_W / 2, 130, 56, '#fff', '#15497e', 12);
 
   for (let i = 0; i < CHARACTERS.length; i++) {
     const ch = CHARACTERS[i];
-    const x = startX + i * (cardW + 20);
-    const y = 200;
+    const x = cardX(i);
     const selected = i === selectedChar;
 
     ctx.save();
     if (selected) {
-      ctx.translate(x + cardW / 2, y + cardH / 2);
-      ctx.scale(1.08, 1.08);
-      ctx.translate(-(x + cardW / 2), -(y + cardH / 2));
+      ctx.translate(x + CARD_W / 2, CARD_Y + CARD_H / 2);
+      ctx.scale(1.07, 1.07);
+      ctx.translate(-(x + CARD_W / 2), -(CARD_Y + CARD_H / 2));
     }
-    // 카드
-    ctx.fillStyle = selected ? '#fff' : 'rgba(255,255,255,0.55)';
-    roundRect(x, y, cardW, cardH, 16);
+    roundRect(x, CARD_Y, CARD_W, CARD_H, 20);
+    ctx.fillStyle = selected ? '#fff' : 'rgba(255,255,255,0.5)';
     ctx.fill();
     if (selected) {
+      ctx.lineWidth = 6;
       ctx.strokeStyle = '#ffb94d';
-      ctx.lineWidth = 5;
-      roundRect(x, y, cardW, cardH, 16);
+      roundRect(x, CARD_Y, CARD_W, CARD_H, 20);
       ctx.stroke();
     }
-    // 캐릭터
-    const frame = selected ? Math.floor(globalTime * 6) % 2 : 0;
-    ctx.drawImage(
-      sprites.chars[ch.id].down[frame],
-      x + cardW / 2 - TILE / 2, y + 30, TILE, TILE + 12
-    );
-    // 이름
-    ctx.font = 'bold 22px "Malgun Gothic", sans-serif';
-    ctx.fillStyle = selected ? '#e8731a' : '#456';
+    const frame = selected ? [0, 1, 0, 2][Math.floor(globalTime * 6) % 4] : 0;
+    blit(sprites.chars[ch.id].down[frame], x + CARD_W / 2 - 39, CARD_Y + 24, 78, 104);
+
+    ctx.font = 'bold 28px "Malgun Gothic", sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(ch.name, x + cardW / 2, y + 135);
+    ctx.fillStyle = selected ? '#e8731a' : '#456';
+    ctx.fillText(ch.name, x + CARD_W / 2, CARD_Y + 172);
     const species = { cat: '고양이', dog: '강아지', penguin: '펭귄', rabbit: '토끼' }[ch.species];
-    ctx.font = '14px "Malgun Gothic", sans-serif';
+    ctx.font = '17px "Malgun Gothic", sans-serif';
     ctx.fillStyle = '#789';
-    ctx.fillText(species, x + cardW / 2, y + 160);
+    ctx.fillText(species, x + CARD_W / 2, CARD_Y + 202);
     ctx.restore();
   }
 
-  ctx.font = 'bold 22px "Malgun Gothic", sans-serif';
-  ctx.fillStyle = Math.sin(globalTime * 5) > -0.2 ? '#fff' : 'rgba(255,255,255,0.3)';
-  ctx.fillText('← → 로 선택, SPACE 로 게임 시작', CANVAS_W / 2, 480);
+  // 시작 버튼
+  const b = BTN_SELECT_START;
+  roundRect(b.x, b.y, b.w, b.h, 32);
+  const bg = ctx.createLinearGradient(0, b.y, 0, b.y + b.h);
+  bg.addColorStop(0, '#ffd84d');
+  bg.addColorStop(1, '#ff9e3d');
+  ctx.fillStyle = bg;
+  ctx.fill();
+  ctx.lineWidth = 5;
+  ctx.strokeStyle = '#b86a14';
+  roundRect(b.x, b.y, b.w, b.h, 32);
+  ctx.stroke();
+  outlinedText('게임 시작!', VIEW_W / 2, b.y + 44, 30, '#fff', '#b86a14', 7);
 
-  ctx.font = '15px "Malgun Gothic", sans-serif';
+  ctx.font = '16px "Malgun Gothic", sans-serif';
   ctx.fillStyle = 'rgba(255,255,255,0.9)';
-  ctx.fillText('AI 봇 3명과 서바이벌 대결! 마지막까지 살아남으세요.', CANVAS_W / 2, 530);
+  ctx.textAlign = 'center';
+  ctx.fillText(touchMode ? '카드를 탭해서 선택 · 한 번 더 탭하면 시작' : '← → 로 선택, SPACE 로 시작', VIEW_W / 2, 675);
 }
 
+// ---------- 인게임 ----------
+
 function drawGame() {
-  if (!game) return;
+  drawBackdrop();
+  drawBoardFrame();
+  drawLeftPanel();
+  drawRightPanel();
+  drawBoard();
+  if (screen === 'playing' && touchMode) drawTouchControls();
+}
 
-  // HUD
-  drawHud();
+function drawBoardFrame() {
+  // 게임판 테두리 프레임
+  roundRect(BOARD_X - 10, BOARD_Y - 10, BOARD_W + 20, BOARD_H + 20, 14);
+  ctx.fillStyle = '#15497e';
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  roundRect(BOARD_X - 10, BOARD_Y - 10, BOARD_W + 20, BOARD_H + 20, 14);
+  ctx.stroke();
+}
 
-  ctx.save();
-  ctx.translate(0, HUD_H);
+function panelBox(x, y, w, h) {
+  roundRect(x, y, w, h, 14);
+  ctx.fillStyle = 'rgba(13, 52, 96, 0.78)';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+  roundRect(x, y, w, h, 14);
+  ctx.stroke();
+}
 
-  // 화면 흔들림
-  if (game.shake > 0) {
-    ctx.translate((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6);
+function drawLeftPanel() {
+  const human = game.human;
+  const px = 18, pw = BOARD_X - 46;
+
+  // 내 캐릭터 카드
+  panelBox(px, BOARD_Y - 10, pw, 250);
+  blit(sprites.portraits[human.charId], px + pw / 2 - 26, BOARD_Y + 6, 52, 52);
+  outlinedText(human.name, px + pw / 2, BOARD_Y + 86, 24, '#ffe14d', '#15497e', 6);
+
+  const stats = [
+    { icon: sprites.items.BALLOON, v: human.maxBalloons },
+    { icon: sprites.items.POTION, v: human.streamLen },
+    { icon: sprites.items.ROLLER, v: human.speed },
+    { icon: sprites.items.NEEDLE, v: human.needles },
+  ];
+  for (let i = 0; i < stats.length; i++) {
+    const sy = BOARD_Y + 104 + i * 36;
+    blit(stats[i].icon, px + 22, sy, 30, 30);
+    ctx.font = 'bold 20px "Malgun Gothic", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff';
+    ctx.fillText('× ' + stats[i].v, px + 62, sy + 23);
   }
+
+  // 상태 메시지
+  if (human.state === ST_TRAPPED) {
+    panelBox(px, BOARD_Y + 256, pw, 64);
+    const blink = Math.sin(globalTime * 8) > 0;
+    outlinedText(blink ? '갇혔다!' : '', px + pw / 2, BOARD_Y + 286, 20, '#ff6b5e', '#5e1410', 5);
+    ctx.font = '13px "Malgun Gothic", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd';
+    ctx.fillText(human.needles > 0 ? '버튼/SPACE로 바늘 사용!' : '바늘이 없어요...', px + pw / 2, BOARD_Y + 308);
+  } else if (human.state === ST_DEAD) {
+    panelBox(px, BOARD_Y + 256, pw, 50);
+    outlinedText('탈락...', px + pw / 2, BOARD_Y + 290, 20, '#9fb6cc', '#15314e', 5);
+  }
+}
+
+function drawRightPanel() {
+  const rx = BOARD_X + BOARD_W + 28, rw = VIEW_W - rx - 18;
+
+  // 타이머
+  panelBox(rx, BOARD_Y - 10, rw, 74);
+  const t = Math.max(0, Math.ceil(game.time));
+  const min = Math.floor(t / 60);
+  const sec = String(t % 60).padStart(2, '0');
+  outlinedText(`${min}:${sec}`, rx + rw / 2, BOARD_Y + 42, 40, t <= 10 ? '#ff6b5e' : '#fff', '#15497e', 8);
+
+  // 플레이어 현황
+  panelBox(rx, BOARD_Y + 80, rw, 4 * 64 + 24);
+  for (let i = 0; i < game.players.length; i++) {
+    const p = game.players[i];
+    const py = BOARD_Y + 96 + i * 64;
+    if (p.state === ST_DEAD) ctx.globalAlpha = 0.38;
+    blit(sprites.portraits[p.charId], rx + 14, py, 44, 44);
+    ctx.font = 'bold 18px "Malgun Gothic", sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = p.isHuman ? '#ffe14d' : '#fff';
+    ctx.fillText(p.name + (p.isHuman ? ' (나)' : ''), rx + 68, py + 20);
+    ctx.font = '14px "Malgun Gothic", sans-serif';
+    ctx.fillStyle = p.state === ST_DEAD ? '#9fb6cc' : p.state === ST_TRAPPED ? '#7cc4f5' : '#7de08a';
+    ctx.fillText(p.state === ST_DEAD ? '탈락' : p.state === ST_TRAPPED ? '갇힘!' : '생존', rx + 68, py + 42);
+    ctx.globalAlpha = 1;
+  }
+
+  // 음소거 안내
+  ctx.font = '13px "Malgun Gothic", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText(isMuted() ? '🔇 음소거 (M)' : '🔊 사운드 (M)', rx + rw / 2, BOARD_Y + 380);
+}
+
+function drawBoard() {
+  ctx.save();
+
+  // 게임판 영역 클리핑 + 흔들림
+  roundRect(BOARD_X, BOARD_Y, BOARD_W, BOARD_H, 6);
+  ctx.clip();
+  let ox = BOARD_X, oy = BOARD_Y;
+  if (game.shake > 0) {
+    ox += (Math.random() - 0.5) * 7;
+    oy += (Math.random() - 0.5) * 7;
+  }
+  ctx.translate(ox, oy);
 
   // 바닥
   for (let y = 0; y < ROWS; y++) {
     for (let x = 0; x < COLS; x++) {
-      ctx.drawImage(sprites.ground[(x + y) % 2], x * TILE, y * TILE);
+      blit(sprites.ground[(x + y) % 2], x * TILE, y * TILE, TILE, TILE);
     }
   }
 
   // 아이템
   for (const it of game.items) {
-    const bob = Math.sin(globalTime * 4 + it.gx + it.gy) * 2;
-    ctx.drawImage(sprites.items[it.type], it.gx * TILE, it.gy * TILE + bob);
+    const bob = Math.sin(globalTime * 4 + it.gx + it.gy) * 2.5;
+    blit(sprites.items[it.type], it.gx * TILE, it.gy * TILE + bob, TILE, TILE);
   }
 
   // 블록
   for (let y = 0; y < ROWS; y++) {
     for (let x = 0; x < COLS; x++) {
       const t = game.grid[y][x];
-      if (t === T_SOLID) ctx.drawImage(sprites.solid, x * TILE, y * TILE);
-      else if (t === T_BOX) ctx.drawImage(sprites.box, x * TILE, y * TILE);
+      if (t === T_SOLID) blit(sprites.solid, x * TILE, y * TILE, TILE, TILE);
+      else if (t === T_BOX) blit(sprites.box, x * TILE, y * TILE, TILE, TILE);
     }
   }
 
@@ -317,21 +530,15 @@ function drawGame() {
     const urgent = b.timer < 1.0;
     const speed = urgent ? 14 : 7;
     const frame = Math.floor(b.anim * speed) % 3;
-    const pulse = urgent ? 1 + Math.sin(b.anim * 20) * 0.06 : 1;
+    const pulse = urgent ? 1 + Math.sin(b.anim * 20) * 0.07 : 1;
     const size = TILE * pulse;
-    ctx.drawImage(
-      sprites.balloon[frame],
-      b.gx * TILE + (TILE - size) / 2,
-      b.gy * TILE + (TILE - size) / 2,
-      size, size
-    );
+    blit(sprites.balloon[frame], b.gx * TILE + (TILE - size) / 2, b.gy * TILE + (TILE - size) / 2, size, size);
   }
 
   // 물줄기
   for (const w of game.waters) {
-    const alpha = Math.min(1, w.timer / 0.15);
-    ctx.globalAlpha = alpha;
-    ctx.drawImage(sprites.water[w.kind], w.gx * TILE, w.gy * TILE);
+    ctx.globalAlpha = Math.min(1, w.timer / 0.12);
+    blit(sprites.water[w.kind], w.gx * TILE, w.gy * TILE, TILE, TILE);
     ctx.globalAlpha = 1;
   }
 
@@ -344,164 +551,153 @@ function drawGame() {
     if (p.state === ST_TRAPPED) {
       img = set.trapped;
     } else {
-      const frame = p.moving ? Math.floor(p.walkAnim) % 2 : 0;
+      const frame = p.moving ? [0, 1, 0, 2][Math.floor(p.walkAnim) % 4] : 0;
       img = set[p.dir][frame];
     }
-    const x = p.px - TILE / 2;
-    const y = p.py - TILE / 2 - 12;
+    const x = p.px - 24;
+    const y = p.py - 40;
 
-    // 무적(바늘 탈출 직후) 깜빡임
-    if (p.immuneTimer > 0 && Math.floor(globalTime * 12) % 2 === 0) {
-      ctx.globalAlpha = 0.4;
-    }
-    ctx.drawImage(img, x, y);
+    if (p.immuneTimer > 0 && Math.floor(globalTime * 12) % 2 === 0) ctx.globalAlpha = 0.4;
+    blit(img, x, y, 48, 64);
     ctx.globalAlpha = 1;
 
-    // 갇힘 물방울 + 남은 시간 게이지
     if (p.state === ST_TRAPPED) {
-      const bw = sprites.bubble.width;
       const wobble = Math.sin(globalTime * 6) * 2;
-      ctx.drawImage(sprites.bubble, p.px - bw / 2, p.py - bw / 2 - 6 + wobble);
-      // 게이지
-      const ratio = p.trapTimer / 7;
-      ctx.fillStyle = 'rgba(0,0,0,0.4)';
-      ctx.fillRect(p.px - 16, p.py - 40, 32, 5);
+      blit(sprites.bubble, p.px - 34, p.py - 34 - 4 + wobble, 68, 68);
+      const ratio = Math.max(0, p.trapTimer / TRAP_DURATION);
+      roundRect(p.px - 17, p.py - 47, 34, 7, 3.5);
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fill();
+      roundRect(p.px - 16, p.py - 46, 32 * ratio, 5, 2.5);
       ctx.fillStyle = ratio > 0.4 ? '#4dd163' : '#e74c3c';
-      ctx.fillRect(p.px - 16, p.py - 40, 32 * ratio, 5);
+      ctx.fill();
     }
 
-    // 이름표 (사람 플레이어 강조)
-    ctx.font = 'bold 11px "Malgun Gothic", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    ctx.fillText(p.name, p.px + 1, p.py - 27);
-    ctx.fillStyle = p.isHuman ? '#ffe14d' : '#fff';
-    ctx.fillText(p.name, p.px, p.py - 28);
+    outlinedText(p.name, p.px, p.py - 50, 13, p.isHuman ? '#ffe14d' : '#fff', 'rgba(0,0,0,0.55)', 3.5, 'bold');
   }
 
   // 이펙트
   for (const ef of game.effects) {
     if (ef.type === 'boxBreak') {
       const t = 1 - ef.timer / 0.4;
-      ctx.fillStyle = `rgba(86, 204, 102, ${1 - t})`;
+      ctx.globalAlpha = 1 - t;
+      // 나무 판자 파편
       for (let i = 0; i < 6; i++) {
-        const a = (i / 6) * Math.PI * 2;
-        const d = t * 24;
-        ctx.beginPath();
-        ctx.arc(ef.x + Math.cos(a) * d, ef.y + Math.sin(a) * d - t * 10, 4 * (1 - t), 0, Math.PI * 2);
-        ctx.fill();
+        const a = (i / 6) * Math.PI * 2 + 0.5;
+        const d = t * 28;
+        ctx.save();
+        ctx.translate(ef.x + Math.cos(a) * d, ef.y + Math.sin(a) * d - t * 14);
+        ctx.rotate(a + t * 4);
+        ctx.fillStyle = i % 2 ? '#e8b46a' : '#c98e4f';
+        ctx.fillRect(-5, -2.5, 10, 5);
+        ctx.restore();
       }
+      ctx.globalAlpha = 1;
     } else if (ef.type === 'splash' || ef.type === 'popBubble') {
       const dur = ef.type === 'splash' ? 0.6 : 0.3;
       const t = 1 - ef.timer / dur;
       ctx.strokeStyle = `rgba(120, 200, 250, ${1 - t})`;
-      ctx.lineWidth = 3;
+      ctx.lineWidth = 4;
       ctx.beginPath();
-      ctx.arc(ef.x, ef.y, t * 36, 0, Math.PI * 2);
+      ctx.arc(ef.x, ef.y, t * 40, 0, Math.PI * 2);
       ctx.stroke();
       ctx.fillStyle = `rgba(170, 225, 255, ${1 - t})`;
       for (let i = 0; i < 8; i++) {
         const a = (i / 8) * Math.PI * 2 + t;
-        const d = t * 30;
+        const d = t * 34;
         ctx.beginPath();
-        ctx.arc(ef.x + Math.cos(a) * d, ef.y + Math.sin(a) * d, 3.5 * (1 - t), 0, Math.PI * 2);
+        ctx.arc(ef.x + Math.cos(a) * d, ef.y + Math.sin(a) * d, 4 * (1 - t), 0, Math.PI * 2);
         ctx.fill();
       }
     } else if (ef.type === 'sparkle') {
       const t = 1 - ef.timer / 0.5;
       ctx.fillStyle = `rgba(255, 225, 77, ${1 - t})`;
-      ctx.font = `${16 + t * 8}px sans-serif`;
+      ctx.font = `${18 + t * 10}px sans-serif`;
       ctx.textAlign = 'center';
-      ctx.fillText('✦', ef.x, ef.y - t * 20);
+      ctx.fillText('✦', ef.x, ef.y - t * 24);
     }
   }
 
   ctx.restore();
 }
 
-function drawHud() {
-  const g = ctx.createLinearGradient(0, 0, 0, HUD_H);
-  g.addColorStop(0, '#1a5fa8');
-  g.addColorStop(1, '#15497e');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, CANVAS_W, HUD_H);
+function drawTouchControls() {
+  // 조이스틱
+  const baseX = joy.active ? joy.baseX : 140;
+  const baseY = joy.active ? joy.baseY : VIEW_H - 150;
+  ctx.globalAlpha = joy.active ? 0.95 : 0.55;
+  blit(sprites.touch.base, baseX - 80, baseY - 80, 160, 160);
+  blit(sprites.touch.knob, baseX + joy.dx - 38, baseY + joy.dy - 38, 76, 76);
+  ctx.globalAlpha = 1;
 
-  const human = game.human;
-
-  // 시간
-  const t = Math.max(0, Math.ceil(game.time));
-  const min = Math.floor(t / 60);
-  const sec = String(t % 60).padStart(2, '0');
-  ctx.font = '900 30px "Malgun Gothic", sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillStyle = t <= 10 ? '#ff6b5e' : '#fff';
-  ctx.fillText(`${min}:${sec}`, CANVAS_W / 2, 42);
-
-  // 능력치 (좌측)
-  ctx.font = 'bold 17px "Malgun Gothic", sans-serif';
-  ctx.textAlign = 'left';
-  ctx.fillStyle = '#ffe14d';
-  const statY = 40;
-  ctx.fillText(`💧×${human.maxBalloons}`, 16, statY);
-  ctx.fillText(`🌊×${human.streamLen}`, 100, statY);
-  ctx.fillText(`👟×${human.speed}`, 184, statY);
-  ctx.fillText(`📍×${human.needles}`, 262, statY);
-
-  // 생존자 수 (우측)
-  const alive = game.players.filter((p) => p.state !== ST_DEAD).length;
-  ctx.textAlign = 'right';
-  ctx.fillStyle = '#fff';
-  ctx.fillText(`생존 ${alive}/4`, CANVAS_W - 16, 40);
-
-  // 음소거 표시
-  if (isMuted()) {
-    ctx.font = '13px "Malgun Gothic", sans-serif';
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText('🔇', CANVAS_W - 110, 40);
+  // 액션 버튼
+  ctx.globalAlpha = 0.92;
+  blit(sprites.touch.btn, ACT_BTN.x - 75, ACT_BTN.y - 75, 150, 150);
+  ctx.globalAlpha = 1;
+  // 갇혔을 때 바늘 안내
+  if (game.human.state === ST_TRAPPED && game.human.needles > 0) {
+    outlinedText('바늘!', ACT_BTN.x, ACT_BTN.y - 90, 22, '#ffe14d', '#15497e', 6);
   }
 }
 
-function drawResult() {
-  ctx.fillStyle = 'rgba(10, 30, 60, 0.65)';
-  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+// ---------- 결과 ----------
 
-  const msg = game.result === 'win' ? '🎉 승리!' : game.result === 'lose' ? '😢 패배...' : '⏰ 무승부';
+function drawResult() {
+  ctx.fillStyle = 'rgba(8, 28, 56, 0.7)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+
+  const msg = game.result === 'win' ? '승리!' : game.result === 'lose' ? '패배...' : '무승부';
+  const color = game.result === 'win' ? '#ffe14d' : game.result === 'lose' ? '#cfe2f5' : '#fff';
   const sub = game.result === 'win'
     ? '최후의 1인이 되었습니다!'
     : game.result === 'lose'
       ? '다음엔 꼭 이길 수 있어요!'
       : '시간이 다 되었습니다.';
 
+  // 승리 캐릭터 출력
+  if (game.result === 'win') {
+    const frame = [0, 1, 0, 2][Math.floor(globalTime * 6) % 4];
+    blit(sprites.chars[game.human.charId].down[frame], VIEW_W / 2 - 48, VIEW_H / 2 - 250, 96, 128);
+  }
+
+  outlinedText(msg, VIEW_W / 2, VIEW_H / 2 - 50, 84, color, '#15497e', 16);
+  ctx.font = '24px "Malgun Gothic", sans-serif';
   ctx.textAlign = 'center';
-  ctx.font = '900 60px "Malgun Gothic", sans-serif';
-  ctx.lineWidth = 10;
-  ctx.strokeStyle = '#1a5fa8';
-  ctx.strokeText(msg, CANVAS_W / 2, CANVAS_H / 2 - 40);
-  ctx.fillStyle = game.result === 'win' ? '#ffe14d' : '#fff';
-  ctx.fillText(msg, CANVAS_W / 2, CANVAS_H / 2 - 40);
-
-  ctx.font = '22px "Malgun Gothic", sans-serif';
   ctx.fillStyle = '#dbeeff';
-  ctx.fillText(sub, CANVAS_W / 2, CANVAS_H / 2 + 16);
+  ctx.fillText(sub, VIEW_W / 2, VIEW_H / 2 + 10);
 
-  ctx.font = 'bold 22px "Malgun Gothic", sans-serif';
-  ctx.fillStyle = Math.sin(globalTime * 5) > -0.2 ? '#fff' : 'rgba(255,255,255,0.3)';
-  ctx.fillText('SPACE: 다시 하기 · ESC: 타이틀로', CANVAS_W / 2, CANVAS_H / 2 + 80);
+  // 버튼
+  for (const [btn, label, grad] of [
+    [BTN_RESULT_RETRY, '다시 하기', ['#ffd84d', '#ff9e3d']],
+    [BTN_RESULT_TITLE, '타이틀로', ['#8fd0f7', '#3d9ce0']],
+  ]) {
+    roundRect(btn.x, btn.y, btn.w, btn.h, 30);
+    const g = ctx.createLinearGradient(0, btn.y, 0, btn.y + btn.h);
+    g.addColorStop(0, grad[0]);
+    g.addColorStop(1, grad[1]);
+    ctx.fillStyle = g;
+    ctx.fill();
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    roundRect(btn.x, btn.y, btn.w, btn.h, 30);
+    ctx.stroke();
+    outlinedText(label, btn.x + btn.w / 2, btn.y + 40, 26, '#fff', 'rgba(20,60,110,0.8)', 6);
+  }
 }
 
-function roundRect(x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
+// ---------- 메인 그리기 ----------
+
+function draw() {
+  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+  if (screen === 'title') drawTitle();
+  else if (screen === 'select') drawSelect();
+  else if (screen === 'playing' || screen === 'result') drawGame();
+  if (screen === 'result') drawResult();
 }
 
-// ---------- 게임 루프 ----------
+// ---------- 루프 ----------
 
-// 테스트용: ?autostart=1 로 접속하면 곧바로 게임 시작, ?screen=select 로 선택 화면
+// 테스트용: ?autostart=1 즉시 시작, ?screen=select 선택 화면, ?touch=1 터치 UI 미리보기
 const params = new URLSearchParams(location.search);
 if (params.get('autostart')) {
   selectedChar = Number(params.get('char') || 0) % CHARACTERS.length;
@@ -509,6 +705,7 @@ if (params.get('autostart')) {
 } else if (params.get('screen') === 'select') {
   screen = 'select';
 }
+if (params.get('touch')) touchMode = true;
 
 let lastTime = performance.now();
 
@@ -519,6 +716,9 @@ function loop(now) {
   globalTime += dt;
 
   if (screen === 'playing' && game) {
+    // 터치 조이스틱 방향 우선, 없으면 키보드 방향 스택
+    input.dir = joyDir() || input.dirStack[input.dirStack.length - 1] || null;
+
     game.update(dt, input);
     if (game.over) {
       screen = 'result';
